@@ -4,6 +4,7 @@ import { dirname, resolve } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { zigCompilerHostArchitecture } from "./zig-compiler-host.mjs";
+import { synchronizationTargets } from "./core-synchronization-stress.mjs";
 
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const workflow = readFileSync(resolve(packageRoot, "../.github/workflows/release.yml"), "utf8");
@@ -60,4 +61,45 @@ test("Windows profile path and lifecycle source regressions are release gates wi
   assert.match(nativeRunner, /assertWindowsBinaryArchitecture\(executable, process\.arch\)/);
   assert.ok(nativeRunner.indexOf("assertWindowsBinaryArchitecture(executable, process.arch)") < nativeRunner.indexOf("run(executable, [])"));
   assert.match(nativeRunner, /run\(executable, \[\]\)/);
+});
+
+test("Core synchronization must pass on every release target before artifacts can publish", () => {
+  const buildJob = workflow.slice(workflow.indexOf("  build:"), workflow.indexOf("\n  release:"));
+  const start = buildJob.indexOf("      - name: Test core synchronization under contention");
+  const upload = buildJob.indexOf("      - name: Upload core artifact");
+  assert.ok(start > buildJob.indexOf("        run: node scripts/package-release.js"));
+  assert.ok(upload > start, "Synchronization stress must gate the first core artifact upload");
+  const section = buildJob.slice(start, buildJob.indexOf("      - name:", start + 12));
+  assert.match(section, /^        run: node scripts\/core-synchronization-stress\.mjs\s*$/m);
+  assert.match(section, /^        working-directory: package\s*$/m);
+  assert.doesNotMatch(section, /^        (?:if|continue-on-error):/m, "No target may skip or ignore this gate");
+  const deadline = section.match(/^        timeout-minutes: (\d+)\s*$/m);
+  assert.ok(deadline && Number(deadline[1]) > 0 && Number(deadline[1]) <= 30,
+    "A deadlocked test process must not leave the release job waiting indefinitely");
+  for (const arch of ["x64", "arm64"]) {
+    assert.match(buildJob, new RegExp(`platform: win32\\s+arch: ${arch}\\b`));
+  }
+});
+
+test("Windows ARM synchronization covers native and emulated binaries even with an x64 JS host", () => {
+  const expected = [
+    { target: "aarch64-windows-gnu", arch: "arm64" },
+    { target: "x86_64-windows-gnu", arch: "x64" },
+  ];
+  for (const host of [
+    { processArch: "arm64", machine: "ARM64", env: {} },
+    { processArch: "x64", machine: "ARM64", env: {} },
+    { processArch: "x64", machine: "AMD64", env: { PROCESSOR_ARCHITEW6432: "ARM64" } },
+  ]) assert.deepEqual(synchronizationTargets({ platform: "win32", ...host }), expected);
+});
+
+test("synchronization targets stay executable on each host and reject incompatible overrides", () => {
+  const windowsX64 = { platform: "win32", processArch: "x64", machine: "AMD64", env: {} };
+  assert.deepEqual(synchronizationTargets(windowsX64), [{ target: "x86_64-windows-gnu", arch: "x64" }]);
+  assert.throws(() => synchronizationTargets({ ...windowsX64, target: "aarch64-windows-gnu" }), /cannot run/);
+  for (const [platform, processArch] of [["linux", "x64"], ["linux", "arm64"], ["darwin", "arm64"]]) {
+    const host = { platform, processArch, machine: processArch, env: {} };
+    assert.deepEqual(synchronizationTargets(host), [{ target: "native", arch: processArch }]);
+    assert.throws(() => synchronizationTargets({ ...host, target: "x86_64-windows-gnu" }), /native target/);
+  }
 });

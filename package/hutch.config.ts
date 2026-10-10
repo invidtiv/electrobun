@@ -43,6 +43,7 @@ export default {
 			"hutch scripts/test-wayland-screen-capture-frame-native.js",
 		"test:views-url-native": "hutch scripts/test-views-url-native.js",
 		"test:core-host-transport": "node --test scripts/core-host-transport.test.mjs",
+		"test:core-synchronization": "node scripts/core-synchronization-stress.mjs",
 		"test:windows-ui-native": "hutch scripts/test-windows-ui-native.js",
 		"test:windows-profile-paths": "node scripts/test-windows-profile-paths.mjs",
 		"test:windows-launcher-identity": "node --test src/launcher/windows_process_identity.integration.test.mjs",

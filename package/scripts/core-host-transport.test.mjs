@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { createCipheriv, randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { createInterface } from "node:readline";
@@ -10,6 +10,7 @@ import { runInNewContext } from "node:vm";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import test, { after, before } from "node:test";
+import { assertWindowsBinaryArchitecture, windowsBinaryArchitecture } from "./windows-binary-architecture.mjs";
 
 const packageRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const zig = process.env.ZIG_BINARY || join(packageRoot, "vendors", "zig", process.platform === "win32" ? "zig.exe" : "zig");
@@ -105,16 +106,17 @@ function bunRuntimeBinary() {
   return binary;
 }
 
-async function buildFixture(directory) {
+async function buildFixture(directory, runtimeArch) {
   assert.ok(existsSync(zig), "Install the repository Zig toolchain or set ZIG_BINARY");
   const source = join(directory, "core.zig");
   await writeFile(source, await readFile(join(packageRoot, "src", "core", "main.zig"), "utf8") + nativeFixture);
+  await writeFile(join(directory, "synchronization.zig"), await readFile(join(packageRoot, "src", "core", "synchronization.zig")));
   const extension = process.platform === "darwin" ? "dylib" : process.platform === "win32" ? "dll" : "so";
   const library = join(directory, `libCoreTransportTest.${extension}`);
-  // Compiler host architecture may differ from the requested fixture. Match
-  // the native runtime that loads it, independently of the compiler's host.
+  // Both the compiler and this Node harness can differ from the executable
+  // that will load this library, including x64 runtimes on Windows ARM64.
   const target = process.platform === "win32"
-    ? ["-target", process.arch === "arm64" ? "aarch64-windows-gnu" : "x86_64-windows-gnu"]
+    ? ["-target", runtimeArch === "arm64" ? "aarch64-windows-gnu" : "x86_64-windows-gnu"]
     : [];
   const child = spawn(zig, ["build-lib", source, ...target, "-dynamic", "-lc", "-O", "Debug", `-femit-bin=${library}`], { stdio: ["ignore", "pipe", "pipe"], timeout: 540_000 });
   let output = "";
@@ -123,18 +125,30 @@ async function buildFixture(directory) {
     child.once("error", reject);
     child.once("exit", (code) => code === 0 ? resolve() : reject(new Error(`Native core fixture build failed (${code}): ${output}`)));
   });
+  if (process.platform === "win32") assertWindowsBinaryArchitecture(library, runtimeArch);
   return library;
 }
 
 let fixtureDirectory;
-let fixtureLibrary;
+const runtimeFixtures = new Map();
 before(async () => {
   // Cold cross-compilation can outlast the runtime deadline, especially with
-  // an emulated compiler selected by a development override. Compile once with
-  // its own bound;
+  // an emulated compiler selected by a development override. Resolve peers
+  // first, then compile once per actual runtime architecture with its own bound;
   // each transport test below retains its independent 90-second deadline.
   fixtureDirectory = await mkdtemp(join(tmpdir(), "electrobun-core-transport-"));
-  fixtureLibrary = await buildFixture(fixtureDirectory);
+  const runtimes = [["Bun", bunRuntimeBinary()], ["Cottontail", runtimeBinary()]].map(([name, binary]) => ({
+    name, binary, arch: process.platform === "win32" ? windowsBinaryArchitecture(binary) : process.arch,
+  }));
+  const builds = await Promise.allSettled([...new Set(runtimes.map(runtime => runtime.arch))].map(async arch => {
+    const directory = join(fixtureDirectory, arch);
+    await mkdir(directory);
+    return [arch, await buildFixture(directory, arch)];
+  }));
+  // Let every compiler finish before cleanup, even if one target fails.
+  for (const build of builds) if (build.status === "rejected") throw build.reason;
+  const libraries = new Map(builds.map(build => build.value));
+  for (const { name, binary, arch } of runtimes) runtimeFixtures.set(name, { binary, library: libraries.get(arch) });
 }, { timeout: 600_000 });
 after(async () => {
   if (fixtureDirectory) {
@@ -230,8 +244,8 @@ function encryptedRequest(keyByte, id, owner) {
 test("readiness survives idle periods and closing its stream preserves core draining", { timeout: 90_000, skip: process.platform === "win32" }, async () => {
   let peer, socket;
   try {
-    const library = fixtureLibrary;
-    peer = startPeer(runtimeBinary(), library, 17, 0, true);
+    const { binary, library } = runtimeFixtures.get("Cottontail");
+    peer = startPeer(binary, library, 17, 0, true);
     const ready = await peer.ready;
     socket = await connect(ready.port);
     for (let id = 1; id <= 3; id++) {
@@ -253,13 +267,12 @@ test("readiness survives idle periods and closing its stream preserves core drai
   }
 });
 
-for (const [runtime, resolveRuntime] of [["Bun", bunRuntimeBinary], ["Cottontail", runtimeBinary]]) {
+for (const runtime of ["Bun", "Cottontail"]) {
 test(`${runtime}: two native cores own distinct loopback ports and decrypt only their own webview RPC`, { timeout: 90_000 }, async () => {
   const peers = [];
   const sockets = [];
   try {
-    const library = fixtureLibrary;
-    const binary = resolveRuntime();
+    const { binary, library } = runtimeFixtures.get(runtime);
     const a = startPeer(binary, library, 17);
     peers.push(a);
     const readyA = await a.ready;

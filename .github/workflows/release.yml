@@ -48,8 +48,8 @@ jobs:
             arch: x64
             platform_name: win
             artifact_platform: win
-          # Build with the x64 Zig compiler under emulation, then execute the
-          # ARM64 launcher, profile-path and Kitchen checks on this runner.
+          # Use the native ARM64 compiler and exercise both native ARM64 and
+          # emulated x64 synchronization on this runner.
           - os: windows-11-arm
             platform: win32
             arch: arm64
@@ -281,6 +281,11 @@ jobs:
         if: matrix.platform == 'win32'
         timeout-minutes: 12
         run: node scripts/test-windows-threaded-shutdown.mjs
+        working-directory: package
+
+      - name: Test core synchronization under contention
+        timeout-minutes: 15
+        run: node scripts/core-synchronization-stress.mjs
         working-directory: package
 
       - name: Test CEF remote debugging policy

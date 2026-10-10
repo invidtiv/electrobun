@@ -51,6 +51,10 @@ Changes since [v2.0.2](/electrobun/guides/changelog/v2-0-2/), available in the
 
 ## Messaging and updates
 
+- Windows Core queues and registries now use native Windows locks and condition
+  variables. This avoids a parking handoff failure reproduced under x64
+  emulation on ARM64 that could leave WebView messages, navigation, and graceful
+  quit or update requests stuck while the window remained interactive.
 - Fixed Cottontail WebView RPC hangs when an idle readiness pipe produced
   `EAGAIN`. The notification stream waits for pipe readiness and owns a separate
   descriptor, so closing it cannot invalidate the native core's pipe. Stream
